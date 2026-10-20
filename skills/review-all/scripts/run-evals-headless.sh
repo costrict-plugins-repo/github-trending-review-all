@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# run-evals-headless.sh — headless, LLM-graded eval runner for /review-all.
+#
+# For each evals/*.json case, REVIEW_ALL_EVAL_RUNS times:
+#   1. Materialize the fixture into a throwaway temp git repo (fresh per run).
+#   2. Run `/review-all` headlessly there with `claude -p` to produce a report.
+#   3. Grade the report against the case's grader.rubric with a second
+#      `claude -p` call (LLM-as-judge) -> PASS/FAIL.
+# A case is scored by majority pass-rate across its graded runs. Prints
+# `RESULT,<id>,PASS|FAIL|ERROR (k/n)` lines so iteration cycles can diff scores.
+#
+# Env:
+#   REVIEW_ALL_EVAL_RUNS=N    runs per case (default 1). >1 smooths LLM noise.
+#   REVIEW_ALL_EVAL_EFFORT=L  pass --effort L (low|medium|high|xhigh|max) to the
+#                             review. LEAVE UNSET to measure at the real operating
+#                             point: on Opus 4.8, low/medium effort SUPPRESSES recall
+#                             (the model reports fewer of the bugs it actually found),
+#                             so a run at --effort low understates the skill. The skill
+#                             pins `effort: high` in its frontmatter as a floor anyway.
+#   REVIEW_ALL_EVAL_MODEL=M   pass --model M to BOTH claude -p calls (the review
+#                             and the LLM judge). LEAVE UNSET and each call runs at
+#                             whatever tier the CLI happens to default to, so any
+#                             A/B measures the change PLUS an unrecorded ambient
+#                             tier and can attribute neither. Set it on every run
+#                             whose numbers will be compared against another run.
+#   REVIEW_ALL_CONFIG_JSON=…  JSON written as .claude/review-all.json into each
+#                             materialized fixture (after staging, so untracked).
+#                             Use to A/B config-driven features, e.g.
+#                             '{"verifierVotes":3}'.
+#   REVIEW_ALL_EVAL_KEEP_DIR=D  persist evidence under D/<case-id>/: CONFIG.txt (once),
+#                             run<r>.report.md and run<r>.judge.txt per graded run
+#                             (r = real run index). Refuses (exit 3, before any claude
+#                             call) when D/<case-id>/ already exists and is non-empty,
+#                             so a rerun never overwrites evidence; use a NEW dir.
+#                             Example: REVIEW_ALL_EVAL_KEEP_DIR=/tmp/keep. Unset =
+#                             behaviour and stdout unchanged.
+#
+# Prereqs:
+#   - `claude` CLI on PATH, authenticated.
+#   - The skill INSTALLED globally (`make install`) so `/review-all` resolves
+#     from any cwd, including the temp fixture repo.
+# Runs the review with --dangerously-skip-permissions because every target is an
+# isolated, throwaway fixture repo created by materialize-fixture.py.
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"        # skills/review-all/scripts
+SKILL_ROOT="$HERE/.."
+EVALS="$SKILL_ROOT/evals"
+filter="${1:-}"
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "run-evals-headless: 'claude' CLI not found on PATH." >&2
+  echo "Use scripts/run-evals.sh for manual mode, or install Claude Code." >&2
+  exit 127
+fi
+
+field() { python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" "$1" "$2"; }
+rubric() {
+  python3 -c "import json,sys;d=json.load(open(sys.argv[1]));g=d.get('grader',{});\
+print(g.get('rubric','') or '\n'.join(d.get('expected_behavior',[])))" "$1"
+}
+bad_report() { [[ -z "${1// }" || "$1" == *"API Error"* || "$1" == *"Execution error"* ]]; }
+# Extract per-tier counts from the report. Delegates to severity-tally.py, which
+# prefers the report's `<!-- review-all-severity: {...} -->` comment and falls
+# back to the Summary section's `**Findings**:` line, then to counting section
+# entries — because the comment is an INSTRUCTION and held in only 7 of 9 runs
+# measured 2026-09-17. Echoes "c,i,d,s,q,total,source"; exits non-zero when no
+# source is recoverable. The source travels WITH the counts so a repaired tally
+# is never mistaken for an obeyed instruction.
+sev_line() { printf '%s' "$1" | python3 "$HERE/severity-tally.py" --source; }
+
+eff=()
+[[ -n "${REVIEW_ALL_EVAL_EFFORT:-}" ]] && eff=(--effort "$REVIEW_ALL_EVAL_EFFORT")
+mdl=()
+[[ -n "${REVIEW_ALL_EVAL_MODEL:-}" ]] && mdl=(--model "$REVIEW_ALL_EVAL_MODEL")
+runs=${REVIEW_ALL_EVAL_RUNS:-1}
+keep="${REVIEW_ALL_EVAL_KEEP_DIR:-}"
+# Bound each claude -p call so a hung review/grade can't stall the whole suite.
+# timeout is optional (GNU coreutils; absent on bare macOS) — uncapped if missing.
+to=(); command -v timeout >/dev/null 2>&1 && to=(timeout "${REVIEW_ALL_EVAL_TIMEOUT:-420}")
+
+review_once() { ( cd "$1" && "${to[@]}" claude -p "$2" --dangerously-skip-permissions "${eff[@]}" "${mdl[@]}" 2>/dev/null ); }
+
+# Provenance header: the tier a number was produced at has to travel WITH the
+# number. An unlabelled results file is indistinguishable from one measured at a
+# different default, which is exactly how a tier decision ends up resting on a
+# run nobody can reproduce.
+config_line="CONFIG,model=${REVIEW_ALL_EVAL_MODEL:-<cli-default:UNPINNED>},effort=${REVIEW_ALL_EVAL_EFFORT:-<skill-floor:high>},runs=${REVIEW_ALL_EVAL_RUNS:-1},timeout=${REVIEW_ALL_EVAL_TIMEOUT:-420},config_json=${REVIEW_ALL_CONFIG_JSON:-<none>}"
+echo "$config_line"
+# One CONFIG.txt per kept case dir: the CONFIG line plus what the skill under test
+# was (git HEAD, dirty flag, installed cache path the CLI actually loads).
+keep_config() {
+  local head dirty cache
+  head=$(git -C "$SKILL_ROOT" rev-parse HEAD 2>/dev/null) || head="<unknown>"
+  dirty=false
+  [[ -n "$(git -C "$SKILL_ROOT" status --porcelain 2>/dev/null)" ]] && dirty=true
+  cache=$(python3 -c "
+import json,os,sys
+try:
+    d=json.load(open(os.path.expanduser('~/.claude/plugins/installed_plugins.json')))
+    for k,v in d.get('plugins',{}).items():
+        if k.startswith('review-all@'):
+            print((v[0] if isinstance(v,list) else v)['installPath']); break
+except Exception:
+    pass
+" 2>/dev/null)
+  [[ -n "$cache" ]] || cache="<unknown>"
+  { echo "$config_line"; echo "skill_head=$head"; echo "skill_dirty=$dirty"; echo "installed_cache=$cache"; } > "$1" \
+    || echo "run-evals-headless: cannot write $1" >&2
+}
+
+# Case files selected by the README skip + prefix filter; used by BOTH the keep-dir
+# pre-pass and the main loop so they cannot disagree.
+selected() {
+  local f id
+  for f in "$EVALS"/*.json; do
+    id=$(basename "$f" .json)
+    case "$id" in README*) continue ;; esac
+    [[ -n "$filter" && "$id" != "$filter"* ]] && continue
+    printf '%s\n' "$f"
+  done
+}
+# Refuse BEFORE any claude call: a later selected case with evidence on disk must
+# not be discovered after earlier cases already spent calls.
+if [[ -n "$keep" ]]; then
+  while IFS= read -r f; do
+    id=$(basename "$f" .json)
+    if [[ -d "$keep/$id" && -n "$(ls -A "$keep/$id" 2>/dev/null)" ]]; then
+      echo "run-evals-headless: $keep/$id exists and is non-empty — refusing to overwrite evidence; use a new REVIEW_ALL_EVAL_KEEP_DIR." >&2
+      exit 3
+    fi
+  done < <(selected)
+fi
+
+pass=0; fail=0; err=0
+while IFS= read -r -u 3 f; do
+  id=$(basename "$f" .json)
+
+  query=$(field "$f" query); [[ -z "$query" ]] && query="/review-all"
+  # Natural-language invocation: appending prose AFTER the slash command would be
+  # parsed as the skill's $ARGUMENTS (a bogus review target). Phrase it as an
+  # instruction instead, and steer away from the interactive Phase 4 menu.
+  prompt="Run the ${query} skill on this repository's changes. Output ONLY the final review report through Phase 3. Do NOT run the Phase 4 interactive menu and do NOT call AskUserQuestion."
+  rb=$(rubric "$f")
+
+  if [[ -n "$keep" ]]; then
+    mkdir -p "$keep/$id" || { echo "run-evals-headless: cannot create $keep/$id" >&2; exit 3; }
+    keep_config "$keep/$id/CONFIG.txt"
+  fi
+  cp=0; graded=0
+  for ((r=1; r<=runs; r++)); do
+    repo=$(python3 "$HERE/materialize-fixture.py" "$f") || continue
+    # Optional A/B treatment config: write it AFTER materialization so it stays
+    # untracked (invisible to the reviewed diff) — lets a run exercise config-
+    # driven features (e.g. verifierVotes) the fixtures can't otherwise carry.
+    if [[ -n "${REVIEW_ALL_CONFIG_JSON:-}" ]]; then
+      mkdir -p "$repo/.claude"
+      printf '%s\n' "$REVIEW_ALL_CONFIG_JSON" > "$repo/.claude/review-all.json"
+    fi
+    report=$(review_once "$repo" "$prompt")
+    bad_report "$report" && report=$(review_once "$repo" "$prompt")   # one retry
+    if bad_report "$report"; then rm -rf "$repo"; continue; fi
+    graded=$((graded+1))
+    if [[ -n "$keep" ]]; then
+      printf '%s\n' "$report" > "$keep/$id/run$r.report.md" || echo "run-evals-headless: cannot write $keep/$id/run$r.report.md" >&2
+    fi
+    # A missing tally is reported, never silently skipped: the per-tier counts are
+    # the only CONTINUOUS signal an A/B has (pass-rates at N=3 sit inside this
+    # suite's noise floor), so losing them quietly costs the whole comparison and
+    # the loss is invisible until someone asks why there are no SCORE lines.
+    if sc=$(sev_line "$report") && [[ -n "$sc" ]]; then
+      echo "SCORE,$id,$sc"
+      # A recovered tally keeps the measurement, but the instruction was still
+      # disobeyed — say so, or a rising non-compliance rate hides behind a
+      # complete-looking results file.
+      case "$sc" in
+        *,comment) ;;
+        *) echo "run-evals-headless: $id — report dropped the <!-- review-all-severity --> comment; tally recovered from ${sc##*,}." >&2 ;;
+      esac
+    else
+      echo "SCORE,$id,MISSING"
+      echo "run-evals-headless: $id — no severity tally recoverable from the report (no comment, no Findings line, no severity sections)." >&2
+    fi
+    judge=$(printf 'You are grading a code-review report against a rubric. Reason briefly, then on the LAST line output exactly PASS or FAIL.\n\n<rubric>\n%s\n</rubric>\n\n<report>\n%s\n</report>\n' \
+        "$rb" "$report" | "${to[@]}" claude -p --dangerously-skip-permissions "${mdl[@]}" 2>/dev/null)
+    if [[ -n "$keep" ]]; then
+      printf '%s' "$judge" > "$keep/$id/run$r.judge.txt" || echo "run-evals-headless: cannot write $keep/$id/run$r.judge.txt" >&2
+    fi
+    if echo "$judge" | grep -qiE '\bPASS\b' && ! echo "$judge" | tail -1 | grep -qiE '\bFAIL\b'; then
+      cp=$((cp+1))
+    fi
+    rm -rf "$repo"
+  done
+
+  if [[ $graded -eq 0 ]]; then
+    err=$((err+1)); echo "RESULT,$id,ERROR (0/$runs graded — infra/transient)"
+  elif [[ $((cp * 2)) -gt $graded ]]; then
+    pass=$((pass+1)); echo "RESULT,$id,PASS ($cp/$graded)"
+  else
+    fail=$((fail+1)); echo "RESULT,$id,FAIL ($cp/$graded)"
+  fi
+done 3< <(selected)
+
+echo "headless evals: $pass passed, $fail failed, $err errored (runs/case=$runs, model=${REVIEW_ALL_EVAL_MODEL:-<cli-default:UNPINNED>})"
+# A filter that matches nothing graded zero cases and must not look like a green
+# suite — an all-zero summary is otherwise indistinguishable from a clean run,
+# and a mistyped filter would silently burn an A/B arm on no cases at all.
+if [[ $((pass + fail + err)) -eq 0 ]]; then
+  echo "run-evals-headless: NO CASES ran${filter:+ (filter \"$filter\" matched nothing)} — not a pass." >&2
+  exit 3
+fi
+[[ $fail -eq 0 && $err -eq 0 ]]

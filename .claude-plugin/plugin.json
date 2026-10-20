@@ -1,0 +1,19 @@
+{
+  "name": "review-all",
+  "version": "0.10.4",
+  "description": "Comprehensive, project-agnostic, multi-agent code review for Claude Code with verification to eliminate false positives.",
+  "author": {
+    "name": "Nicolas Coevoet",
+    "url": "https://github.com/ncoevoet"
+  },
+  "homepage": "https://github.com/ncoevoet/claude-review-all",
+  "repository": "https://github.com/ncoevoet/claude-review-all",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "review",
+    "multi-agent",
+    "static-analysis",
+    "skill"
+  ]
+}
