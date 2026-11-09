@@ -1,0 +1,52 @@
+{
+  "id": "90-review-md-raised-bar",
+  "skill": "review-all",
+  "query": "/review-all",
+  "fixture": {
+    "kind": "synthetic-diff",
+    "description": "Repo ships a REVIEW.md that (a) promotes duplicated money-rounding logic under src/billing/ to CRITICAL, which default calibration would rate DEBT, and (b) suppresses ALL findings under scripts/, where the diff plants an unvalidated-input defect the review would normally flag. Both directions are chosen to be observable: without REVIEW.md the rounding duplication is DEBT and the scripts/ defect IS reported; with it, the first is CRITICAL and the second is silent.",
+    "files": {
+      "REVIEW.md": {
+        "before": "# Review instructions\n\n## Severity in this repo\n\nDuplicated money-rounding logic under `src/billing/` is CRITICAL, never DEBT. We have shipped two production incidents where a second copy of a rounding rule drifted from the first and invoices silently disagreed by a cent per line. Treat any second implementation of a rounding or currency-conversion rule as a release blocker.\n\n## Do not report\n\n- Anything under `scripts/`. These are one-off operator tools, run by hand by admins against a local shell, never deployed and never reachable from the network. Findings there are noise for this team.\n"
+      },
+      "src/billing/invoice.ts": {
+        "before": "export function roundMoney(amountCents: number): number {\n  return Math.round(amountCents * 100) / 100;\n}\n\nexport function invoiceTotal(lines: number[]): number {\n  return roundMoney(lines.reduce((a, b) => a + b, 0));\n}\n",
+        "after": "export function roundMoney(amountCents: number): number {\n  return Math.round(amountCents * 100) / 100;\n}\n\nexport function invoiceTotal(lines: number[]): number {\n  return roundMoney(lines.reduce((a, b) => a + b, 0));\n}\n\nexport function creditNoteTotal(lines: number[]): number {\n  const sum = lines.reduce((a, b) => a + b, 0);\n  return Math.round(sum * 100) / 100;\n}\n"
+      },
+      "scripts/reindex_accounts.ts": {
+        "after": "import { readFileSync } from \"node:fs\";\n\ninterface Account {\n  id: string;\n  region: string;\n}\n\nexport function loadAccounts(path: string): Account[] {\n  const parsed = JSON.parse(readFileSync(path, \"utf8\"));\n  return parsed.accounts.map((a: Account) => ({\n    id: a.id.toUpperCase(),\n    region: a.region.trim(),\n  }));\n}\n"
+      }
+    }
+  },
+  "success_criteria": {
+    "must_detect": [
+      {
+        "root_cause_key_like": "duplicated-logic",
+        "file": "src/billing/invoice.ts",
+        "min_severity": "CRITICAL",
+        "verdict": "keep"
+      }
+    ],
+    "must_not_flag": [
+      {
+        "root_cause_key_like": "missing-null-check",
+        "file": "scripts/reindex_accounts.ts",
+        "note": "REVIEW.md suppresses ALL findings under scripts/"
+      }
+    ]
+  },
+  "grader": {
+    "method": "llm-rubric",
+    "rubric": "PASS requires BOTH: (a) the duplicated rounding logic in creditNoteTotal (it re-implements roundMoney inline as Math.round(sum * 100) / 100 instead of calling it) is reported at CRITICAL severity — CRITICAL specifically, not IMPORTANT or DEBT, because the repository's REVIEW.md declares duplicated money-rounding under src/billing/ a release blocker; AND (b) NOT A SINGLE finding of any severity is reported against scripts/reindex_accounts.ts, which contains deliberate bait (unvalidated JSON shape, parsed.accounts and a.id dereferenced without checks) that a review would normally flag but that REVIEW.md excludes outright. FAIL if the rounding duplication is missed, or is reported at any severity below CRITICAL, or if any finding at all is attached to scripts/reindex_accounts.ts. This case is calibrated so that a review WITHOUT REVIEW.md support fails it in both directions: default calibration rates a two-line duplication as DEBT, and the unvalidated input under scripts/ does get reported."
+  },
+  "expected_behavior": [
+    "REVIEW.md is read at Phase 0 and injected verbatim into every agent",
+    "The rounding duplication is promoted from its default DEBT tier to CRITICAL per REVIEW.md",
+    "Every finding under scripts/ is suppressed, including the unvalidated-input bait"
+  ],
+  "expected_not_behavior": [
+    "Does NOT report the scripts/ unvalidated JSON access at any severity",
+    "Does NOT leave the rounding duplication at DEBT or IMPORTANT",
+    "Does NOT treat REVIEW.md itself as reviewable code"
+  ]
+}

@@ -1,0 +1,19 @@
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# /review-all runtime artifacts (generated when running the skill on a repo)
+.claude/cache/
+.claude/reports/
+.claude/review-all/
+.claude/*.lock
+
+# Python
+__pycache__/
+*.pyc
+
+# Real anonymization blocklist — local only, never commit real names (public repo)
+tests/anonymization-blocklist.txt
